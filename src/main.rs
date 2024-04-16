@@ -1,9 +1,12 @@
 // Uncomment this block to pass the first stage
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::path::Path;
 
 use anyhow::Context;
+use clap::{Arg, Command};
+use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::ReadHalf;
@@ -26,6 +29,24 @@ struct HttpRequest {
     version: String,
     headers: HashMap<String, String>,
     content: Option<String>,
+}
+
+impl HttpRequest {
+    fn response_404(&self) -> HttpResponseBuilder {
+        HttpResponseBuilder {
+            status_code: HttpStatusCode::NotFound404,
+            version: self.version.clone(),
+            content: None,
+        }
+    }
+
+    fn response(&self, content: Option<String>) -> HttpResponseBuilder {
+        HttpResponseBuilder {
+            status_code: HttpStatusCode::Ok200,
+            version: self.version.clone(),
+            content,
+        }
+    }
 }
 
 struct HttpResponseBuilder {
@@ -113,7 +134,7 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
     })
 }
 
-fn route_request(request: HttpRequest) -> HttpResponseBuilder {
+async fn route_request(request: HttpRequest, directory: String) -> HttpResponseBuilder {
     let route = request.route.split('/').skip(1).collect::<Vec<&str>>();
     println!("DEBUG: route {route:?}");
     let response = match route.as_slice() {
@@ -122,46 +143,58 @@ fn route_request(request: HttpRequest) -> HttpResponseBuilder {
             version: request.version,
             content: None,
         },
-        ["echo", val @ ..] => HttpResponseBuilder {
-            status_code: HttpStatusCode::Ok200,
-            version: request.version,
-            content: Some(val.join("/").to_string()),
-        },
+        ["echo", val @ ..] => {
+            request.response(Some(val.join("/").to_string()))
+        }
         ["user-agent"] => {
             let user_agent = request.headers.get("User-Agent");
             match user_agent {
                 Some(user_agent) => {
-                    HttpResponseBuilder {
-                        status_code: HttpStatusCode::Ok200,
-                        version: request.version,
-                        content: Some(user_agent.clone()),
-                    }
+                    let user_agent = user_agent.clone();
+                    request.response(Some(user_agent))
                 }
                 None => {
-                    HttpResponseBuilder {
-                        status_code: HttpStatusCode::NotFound404,
-                        version: request.version,
-                        content: None,
-                    }
+                    request.response_404()
                 }
             }
         }
-        _ => HttpResponseBuilder {
-            status_code: HttpStatusCode::NotFound404,
-            version: request.version,
-            content: None,
-        },
+        ["files", filename] => {
+            let dir = Path::new(&directory);
+            let file_path = dir.join(filename);
+            println!("DEBUG: {}", file_path.display());
+
+            let mut file = match File::open(&file_path).await {
+                Err(err) => {
+                    eprintln!("ERROR: couldn't open path {}, error: {err}", file_path.display());
+                    return request.response_404();
+                }
+                Ok(file) => file
+            };
+
+            let mut file_content = String::new();
+            match file.read_to_string(&mut file_content).await {
+                Ok(_) => {
+                    request.response(Some(file_content))
+                }
+                Err(err) => {
+                    eprintln!("ERROR: couldn't read file, error: {err}");
+                    request.response_404()
+                }
+            }
+        }
+
+        _ => request.response_404(),
     };
     response
 }
 
-async fn stream_handler(mut stream: TcpStream) -> anyhow::Result<()> {
+async fn stream_handler(mut stream: TcpStream, directory: String) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.split();
     let mut reader = BufReader::new(&mut reader);
     let request = reader_request(&mut reader).await?;
     println!("DEBUG: request {:?}", request);
 
-    let response = route_request(request);
+    let response = route_request(request, directory).await;
     let response_string: String = response.into();
 
     println!("DEBUG: {response_string}");
@@ -172,15 +205,31 @@ async fn stream_handler(mut stream: TcpStream) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let matches = Command::new("http-server")
+        .arg(
+            Arg::new("directory")
+                .long("directory")
+                .required(true)
+        )
+        .get_matches();
+
+    let directory = matches
+        .get_one::<String>("directory")
+        .unwrap()
+        .to_string();
+    println!("DEBUG: directory {:?}", directory);
+
+
     let addr = "127.0.0.1:4221";
     let listener = TcpListener::bind(addr).await?;
-    println!("listening {addr}");
+    println!("INFO: listening {addr}");
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let directory = directory.clone();
         tokio::spawn(
             async move {
-                if let Err(err) = stream_handler(stream).await {
+                if let Err(err) = stream_handler(stream, directory).await {
                     eprintln!("ERROR: connection ended with {err}")
                 }
             }

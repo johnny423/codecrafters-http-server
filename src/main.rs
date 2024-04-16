@@ -178,8 +178,12 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        if let Err(err) = stream_handler(stream).await {
-            eprintln!("ERROR: connection ended with {err}")
-        }
+        tokio::spawn(
+            async move {
+                if let Err(err) = stream_handler(stream).await {
+                    eprintln!("ERROR: connection ended with {err}")
+                }
+            }
+        );
     }
 }

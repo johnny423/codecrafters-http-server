@@ -89,7 +89,7 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
             break;
         }
         let (name, val) = line
-            .split_once(":")
+            .split_once(": ")
             .with_context(|| format!("ERROR reading request: bad header '{line}'"))?;
 
         headers.insert(name.to_string(), val.to_string());
@@ -122,11 +122,30 @@ fn route_request(request: HttpRequest) -> HttpResponseBuilder {
             version: request.version,
             content: None,
         },
-        ["echo", val@..] => HttpResponseBuilder {
+        ["echo", val @ ..] => HttpResponseBuilder {
             status_code: HttpStatusCode::Ok200,
             version: request.version,
             content: Some(val.join("/").to_string()),
         },
+        ["user-agent"] => {
+            let user_agent = request.headers.get("User-Agent");
+            match user_agent {
+                Some(user_agent) => {
+                    HttpResponseBuilder {
+                        status_code: HttpStatusCode::Ok200,
+                        version: request.version,
+                        content: Some(user_agent.clone()),
+                    }
+                }
+                None => {
+                    HttpResponseBuilder {
+                        status_code: HttpStatusCode::NotFound404,
+                        version: request.version,
+                        content: None,
+                    }
+                }
+            }
+        }
         _ => HttpResponseBuilder {
             status_code: HttpStatusCode::NotFound404,
             version: request.version,

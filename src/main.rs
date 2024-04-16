@@ -2,8 +2,13 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use clap::{Arg, Command};
+use nom::bytes::complete::{tag, take_while1};
+use nom::character::complete::{char, crlf, space0};
+use nom::IResult;
+use nom::multi::many1;
+use nom::sequence::{pair, terminated};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -35,25 +40,7 @@ struct HttpRequest {
     route: String,
     version: String,
     headers: HashMap<String, String>,
-    body: Option<String>, //todo: rename
-}
-
-impl HttpRequest {
-    fn response_404(&self) -> HttpResponseBuilder {
-        HttpResponseBuilder {
-            status_code: HttpStatusCode::NotFound404,
-            version: self.version.clone(),
-            content: Content::Empty,
-        }
-    }
-
-    fn response(&self, content: Content) -> HttpResponseBuilder {
-        HttpResponseBuilder {
-            status_code: HttpStatusCode::Ok200,
-            version: self.version.clone(),
-            content,
-        }
-    }
+    body: Option<String>,
 }
 
 struct HttpResponseBuilder {
@@ -96,6 +83,7 @@ impl Into<String> for HttpResponseBuilder {
 async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Result<HttpRequest> {
     let mut request_content = String::new();
 
+    // read until empty line
     let mut temp_line = String::new();
     while let Ok(n) = reader.read_line(&mut temp_line).await {
         if n == 0 || temp_line.trim().is_empty() {
@@ -106,45 +94,15 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
     }
 
     println!("DEBUG: content {request_content}");
-    let mut lines = request_content.lines();
 
-    // first line
-    let first = lines
-        .next()
-        .context("ERROR reading request: empty request")?;
-    let mut split = first.split(" ");
+    // parse request
+    let (_left, mut request) = parse_http_request(&request_content)
+        .map_err(|e| e.to_owned())?;
 
-    let method = split
-        .next()
-        .context("ERROR reading request: missing method")?;
-    let method = match method {
-        "GET" => HttpMethod::Get,
-        "POST" => HttpMethod::Post,
-        _ => { Err(anyhow!("Error reading request: unsupported method"))? }
-    };
 
-    let route = split
-        .next()
-        .context("ERROR reading request: missing route")?;
-    let version = split
-        .next()
-        .context("ERROR reading request: missing version")?;
-
-    // headers
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let (name, val) = line
-            .split_once(": ")
-            .with_context(|| format!("ERROR reading request: bad header '{line}'"))?;
-
-        headers.insert(name.to_string(), val.to_string());
-    }
-
-    // content
-    let body = if let Some(length) = headers.get("Content-Length") {
+    // read body
+    let body = if let Some(length) = request.headers.get("Content-Length") {
+        println!("here!!");
         let length = length.parse()
             .context("ERROR: content length is not a valid number")?;
         println!("DEBUG: content length - {length}");
@@ -158,15 +116,49 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
             .context("ERROR: request content is not utf8")?;
         println!("DEBUG: extracted content: {x}");
         Some(x)
-    } else { None };
+    } else {
+        println!("there");
+        None
+    };
 
-    Ok(HttpRequest {
-        method,
-        headers,
-        body: body,
-        route: route.to_string(),
-        version: version.to_string(),
-    })
+    request.body = body;
+    Ok(request)
+}
+
+fn non_whitespace(input: &str) -> IResult<&str, &str> {
+    take_while1(|c: char| !c.is_whitespace())(input)
+}
+
+fn parse_http_request(content: &str) -> IResult<&str, HttpRequest> {
+    let (input, method) = terminated(non_whitespace, space0)(content)?;
+    let (input, route) = terminated(non_whitespace, space0)(input)?;
+    let (input, version) = terminated(non_whitespace, crlf)(input)?;
+
+    let (input, headers) = many1(pair(
+        terminated(take_while1(|c: char| c != ':'), tag(": ")),
+        terminated(non_whitespace, crlf),
+    ))(input)?;
+
+    let method = match method {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        _ => { panic!(); }
+    };
+
+    let headers: HashMap<String, String> = headers.into_iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+
+    Ok(
+        (input, HttpRequest {
+            method,
+            headers,
+            route: route.to_string(),
+            version: version.to_string(),
+            body: None,
+        }
+        )
+    )
 }
 
 async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyhow::Result<HttpResponseBuilder> {
@@ -174,13 +166,23 @@ async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyh
     println!("DEBUG: route {route:?}");
     let response = match (&request.method, route.as_slice()) {
         (HttpMethod::Get, [""]) => {
+            let content = Content::Empty;
             Ok(
-                request.response(Content::Empty)
+                HttpResponseBuilder {
+                    status_code: HttpStatusCode::Ok200,
+                    version: request.version.clone(),
+                    content,
+                }
             )
         }
         (HttpMethod::Get, ["echo", val @ ..]) => {
+            let content = Content::Text(val.join("/").to_string());
             Ok(
-                request.response(Content::Text(val.join("/").to_string()))
+                HttpResponseBuilder {
+                    status_code: HttpStatusCode::Ok200,
+                    version: request.version.clone(),
+                    content,
+                }
             )
         }
         (HttpMethod::Get, ["user-agent"]) => {
@@ -188,20 +190,35 @@ async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyh
             match user_agent {
                 Some(user_agent) => {
                     let user_agent = user_agent.clone();
+                    let content = Content::Text(user_agent);
                     Ok(
-                        request.response(Content::Text(user_agent))
+                        HttpResponseBuilder {
+                            status_code: HttpStatusCode::Ok200,
+                            version: request.version.clone(),
+                            content,
+                        }
                     )
                 }
                 None => {
                     Ok(
-                        request.response_404()
+                        HttpResponseBuilder {
+                            status_code: HttpStatusCode::NotFound404,
+                            version: request.version.clone(),
+                            content: Content::Empty,
+                        }
                     )
                 }
             }
         }
         (HttpMethod::Get, ["files", filename]) => {
             let file_path = match directory {
-                None => { return Ok(request.response_404()); }
+                None => {
+                    return Ok(HttpResponseBuilder {
+                        status_code: HttpStatusCode::NotFound404,
+                        version: request.version.clone(),
+                        content: Content::Empty,
+                    });
+                }
                 Some(directory) => {
                     let dir = Path::new(&directory);
                     dir.join(filename)
@@ -213,7 +230,11 @@ async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyh
             let mut file = match File::open(&file_path).await {
                 Err(err) => {
                     eprintln!("ERROR: couldn't open path {}, error: {err}", file_path.display());
-                    return Ok(request.response_404());
+                    return Ok(HttpResponseBuilder {
+                        status_code: HttpStatusCode::NotFound404,
+                        version: request.version.clone(),
+                        content: Content::Empty,
+                    });
                 }
                 Ok(file) => file
             };
@@ -221,20 +242,35 @@ async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyh
             let mut file_content = String::new();
             match file.read_to_string(&mut file_content).await {
                 Ok(_) => {
+                    let content = Content::OctetStream(file_content);
                     Ok(
-                        request.response(Content::OctetStream(file_content))
+                        HttpResponseBuilder {
+                            status_code: HttpStatusCode::Ok200,
+                            version: request.version.clone(),
+                            content,
+                        }
                     )
                 }
                 Err(err) => {
                     eprintln!("ERROR: couldn't read file, error: {err}");
-                    Ok(request.response_404())
+                    Ok(HttpResponseBuilder {
+                        status_code: HttpStatusCode::NotFound404,
+                        version: request.version.clone(),
+                        content: Content::Empty,
+                    })
                 }
             }
         }
         (HttpMethod::Post, ["files", filename]) => {
             let content = request.body.clone().context("Error: got no content")?;
             let file_path = match directory {
-                None => { return Ok(request.response_404()); }
+                None => {
+                    return Ok(HttpResponseBuilder {
+                        status_code: HttpStatusCode::NotFound404,
+                        version: request.version.clone(),
+                        content: Content::Empty,
+                    });
+                }
                 Some(directory) => {
                     let dir = Path::new(&directory);
                     dir.join(filename)
@@ -252,7 +288,11 @@ async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyh
                 }
             )
         }
-        _ => Ok(request.response_404()),
+        _ => Ok(HttpResponseBuilder {
+            status_code: HttpStatusCode::NotFound404,
+            version: request.version.clone(),
+            content: Content::Empty,
+        }),
     };
     response
 }

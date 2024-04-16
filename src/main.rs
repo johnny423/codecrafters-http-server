@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::{Arg, Command};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -18,12 +18,15 @@ enum Content {
 #[derive(Debug)]
 enum HttpStatusCode {
     Ok200,
+    Created201,
     NotFound404,
+    InternalError500,
 }
 
 #[derive(Debug)]
 enum HttpMethod {
     Get,
+    Post,
 }
 
 #[derive(Debug)]
@@ -32,7 +35,7 @@ struct HttpRequest {
     route: String,
     version: String,
     headers: HashMap<String, String>,
-    content: Option<String>,
+    body: Option<String>, //todo: rename
 }
 
 impl HttpRequest {
@@ -62,8 +65,10 @@ struct HttpResponseBuilder {
 impl Into<String> for HttpResponseBuilder {
     fn into(self) -> String {
         let (code, phrase) = match self.status_code {
-            HttpStatusCode::Ok200 => (200, "OK"),
+            HttpStatusCode::Ok200 => (200, "Ok"),
+            HttpStatusCode::Created201 => (201, "Created"),
             HttpStatusCode::NotFound404 => (404, "NotFound"),
+            HttpStatusCode::InternalError500 => (500, "InternalError"),
         };
         let mut response = format!("{} {} {}\r\n", self.version, code, phrase);
         match self.content {
@@ -91,11 +96,13 @@ impl Into<String> for HttpResponseBuilder {
 async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Result<HttpRequest> {
     let mut request_content = String::new();
 
-    let prev = 0;
-    while let n = reader.read_line(&mut request_content).await? {
-        if n - prev == 2 {
+    let mut temp_line = String::new();
+    while let Ok(n) = reader.read_line(&mut temp_line).await {
+        if n == 0 || temp_line.trim().is_empty() {
             break;
         }
+        request_content.push_str(&temp_line); // Append the non-empty line
+        temp_line.clear();
     }
 
     println!("DEBUG: content {request_content}");
@@ -106,10 +113,16 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
         .next()
         .context("ERROR reading request: empty request")?;
     let mut split = first.split(" ");
-    let _ = split
+
+    let method = split
         .next()
         .context("ERROR reading request: missing method")?;
-    let method = HttpMethod::Get;
+    let method = match method {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        _ => { Err(anyhow!("Error reading request: unsupported method"))? }
+    };
+
     let route = split
         .next()
         .context("ERROR reading request: missing route")?;
@@ -131,46 +144,64 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
     }
 
     // content
-    let mut content = None;
-    if let Some(length) = headers.get("Content-Length") {
-        let length = length.parse()?;
-        let mut buffer = Vec::with_capacity(length);
-        reader.read_exact(&mut buffer).await?;
-        content = Option::from(String::from_utf8(buffer)?);
-    }
+    let body = if let Some(length) = headers.get("Content-Length") {
+        let length = length.parse()
+            .context("ERROR: content length is not a valid number")?;
+        println!("DEBUG: content length - {length}");
+
+        let mut buffer = vec![0; length];
+        reader.read_exact(&mut buffer).await
+            .context("ERROR: reading request content")?;
+        println!("DEBUG: buffer {buffer:?}");
+
+        let x = String::from_utf8(buffer)
+            .context("ERROR: request content is not utf8")?;
+        println!("DEBUG: extracted content: {x}");
+        Some(x)
+    } else { None };
 
     Ok(HttpRequest {
         method,
         headers,
-        content,
+        body: body,
         route: route.to_string(),
         version: version.to_string(),
     })
 }
 
-async fn route_request(request: HttpRequest, directory: Option<String>) -> HttpResponseBuilder {
+async fn route_request(request: &HttpRequest, directory: Option<String>) -> anyhow::Result<HttpResponseBuilder> {
     let route = request.route.split('/').skip(1).collect::<Vec<&str>>();
     println!("DEBUG: route {route:?}");
-    let response = match route.as_slice() {
-        [""] => request.response(Content::Empty),
-        ["echo", val @ ..] => {
-            request.response(Content::Text(val.join("/").to_string()))
+    let response = match (&request.method, route.as_slice()) {
+        (HttpMethod::Get, [""]) => {
+            Ok(
+                request.response(Content::Empty)
+            )
         }
-        ["user-agent"] => {
+        (HttpMethod::Get, ["echo", val @ ..]) => {
+            Ok(
+                request.response(Content::Text(val.join("/").to_string()))
+            )
+        }
+        (HttpMethod::Get, ["user-agent"]) => {
             let user_agent = request.headers.get("User-Agent");
             match user_agent {
                 Some(user_agent) => {
                     let user_agent = user_agent.clone();
-                    request.response(Content::Text(user_agent))
+                    Ok(
+                        request.response(Content::Text(user_agent))
+                    )
                 }
                 None => {
-                    request.response_404()
+                    Ok(
+                        request.response_404()
+                    )
                 }
             }
         }
-        ["files", filename] => {
+        (HttpMethod::Get, ["files", filename]) => {
             let file_path = match directory {
-                None => { return request.response_404(); }
+                None => { return Ok(request.response_404()); }
                 Some(directory) => {
                     let dir = Path::new(&directory);
                     dir.join(filename)
@@ -182,7 +213,7 @@ async fn route_request(request: HttpRequest, directory: Option<String>) -> HttpR
             let mut file = match File::open(&file_path).await {
                 Err(err) => {
                     eprintln!("ERROR: couldn't open path {}, error: {err}", file_path.display());
-                    return request.response_404();
+                    return Ok(request.response_404());
                 }
                 Ok(file) => file
             };
@@ -190,16 +221,38 @@ async fn route_request(request: HttpRequest, directory: Option<String>) -> HttpR
             let mut file_content = String::new();
             match file.read_to_string(&mut file_content).await {
                 Ok(_) => {
-                    request.response(Content::OctetStream(file_content))
+                    Ok(
+                        request.response(Content::OctetStream(file_content))
+                    )
                 }
                 Err(err) => {
                     eprintln!("ERROR: couldn't read file, error: {err}");
-                    request.response_404()
+                    Ok(request.response_404())
                 }
             }
         }
+        (HttpMethod::Post, ["files", filename]) => {
+            let content = request.body.clone().context("Error: got no content")?;
+            let file_path = match directory {
+                None => { return Ok(request.response_404()); }
+                Some(directory) => {
+                    let dir = Path::new(&directory);
+                    dir.join(filename)
+                }
+            };
 
-        _ => request.response_404(),
+            println!("DEBUG: {}", file_path.display());
+            let mut file = File::create(&file_path).await?;
+            file.write_all(content.as_bytes()).await?;
+            Ok(
+                HttpResponseBuilder {
+                    status_code: HttpStatusCode::Created201,
+                    version: request.version.clone(),
+                    content: Content::Empty,
+                }
+            )
+        }
+        _ => Ok(request.response_404()),
     };
     response
 }
@@ -210,7 +263,13 @@ async fn stream_handler(mut stream: TcpStream, directory: Option<String>) -> any
     let request = reader_request(&mut reader).await?;
     println!("DEBUG: request {:?}", request);
 
-    let response = route_request(request, directory).await;
+    let response = route_request(&request, directory).await.unwrap_or_else(
+        |_| HttpResponseBuilder {
+            status_code: HttpStatusCode::InternalError500,
+            version: request.version.clone(),
+            content: Content::Empty,
+        }
+    );
     let response_string: String = response.into();
 
     println!("DEBUG: {response_string}");

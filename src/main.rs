@@ -1,5 +1,3 @@
-// Uncomment this block to pass the first stage
-
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,6 +8,12 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::ReadHalf;
+
+enum Content {
+    Empty,
+    Text(String),
+    OctetStream(String),
+}
 
 #[derive(Debug)]
 enum HttpStatusCode {
@@ -36,11 +40,11 @@ impl HttpRequest {
         HttpResponseBuilder {
             status_code: HttpStatusCode::NotFound404,
             version: self.version.clone(),
-            content: None,
+            content: Content::Empty,
         }
     }
 
-    fn response(&self, content: Option<String>) -> HttpResponseBuilder {
+    fn response(&self, content: Content) -> HttpResponseBuilder {
         HttpResponseBuilder {
             status_code: HttpStatusCode::Ok200,
             version: self.version.clone(),
@@ -52,7 +56,7 @@ impl HttpRequest {
 struct HttpResponseBuilder {
     status_code: HttpStatusCode,
     version: String,
-    content: Option<String>,
+    content: Content,
 }
 
 impl Into<String> for HttpResponseBuilder {
@@ -62,14 +66,24 @@ impl Into<String> for HttpResponseBuilder {
             HttpStatusCode::NotFound404 => (404, "NotFound"),
         };
         let mut response = format!("{} {} {}\r\n", self.version, code, phrase);
-        if let Some(content) = self.content {
-            response.push_str(&format!("Content-Type: text/plain\r\n"));
-            response.push_str(&format!("Content-Length: {}\r\n", content.len()));
-            response.push_str("\r\n");
-            response.push_str(&content);
-        } else {
-            response.push_str("\r\n");
+        match self.content {
+            Content::Empty => {
+                response.push_str("\r\n");
+            }
+            Content::Text(content) => {
+                response.push_str(&format!("Content-Type: text/plain\r\n"));
+                response.push_str(&format!("Content-Length: {}\r\n", content.len()));
+                response.push_str("\r\n");
+                response.push_str(&content);
+            }
+            Content::OctetStream(content) => {
+                response.push_str(&format!("Content-Type: application/octet-stream\r\n"));
+                response.push_str(&format!("Content-Length: {}\r\n", content.len()));
+                response.push_str("\r\n");
+                response.push_str(&content);
+            }
         }
+
         response
     }
 }
@@ -134,24 +148,20 @@ async fn reader_request(reader: &mut BufReader<&mut ReadHalf<'_>>) -> anyhow::Re
     })
 }
 
-async fn route_request(request: HttpRequest, directory: String) -> HttpResponseBuilder {
+async fn route_request(request: HttpRequest, directory: Option<String>) -> HttpResponseBuilder {
     let route = request.route.split('/').skip(1).collect::<Vec<&str>>();
     println!("DEBUG: route {route:?}");
     let response = match route.as_slice() {
-        [""] => HttpResponseBuilder {
-            status_code: HttpStatusCode::Ok200,
-            version: request.version,
-            content: None,
-        },
+        [""] => request.response(Content::Empty),
         ["echo", val @ ..] => {
-            request.response(Some(val.join("/").to_string()))
+            request.response(Content::Text(val.join("/").to_string()))
         }
         ["user-agent"] => {
             let user_agent = request.headers.get("User-Agent");
             match user_agent {
                 Some(user_agent) => {
                     let user_agent = user_agent.clone();
-                    request.response(Some(user_agent))
+                    request.response(Content::Text(user_agent))
                 }
                 None => {
                     request.response_404()
@@ -159,8 +169,14 @@ async fn route_request(request: HttpRequest, directory: String) -> HttpResponseB
             }
         }
         ["files", filename] => {
-            let dir = Path::new(&directory);
-            let file_path = dir.join(filename);
+            let file_path = match directory {
+                None => { return request.response_404(); }
+                Some(directory) => {
+                    let dir = Path::new(&directory);
+                    dir.join(filename)
+                }
+            };
+
             println!("DEBUG: {}", file_path.display());
 
             let mut file = match File::open(&file_path).await {
@@ -174,7 +190,7 @@ async fn route_request(request: HttpRequest, directory: String) -> HttpResponseB
             let mut file_content = String::new();
             match file.read_to_string(&mut file_content).await {
                 Ok(_) => {
-                    request.response(Some(file_content))
+                    request.response(Content::OctetStream(file_content))
                 }
                 Err(err) => {
                     eprintln!("ERROR: couldn't read file, error: {err}");
@@ -188,7 +204,7 @@ async fn route_request(request: HttpRequest, directory: String) -> HttpResponseB
     response
 }
 
-async fn stream_handler(mut stream: TcpStream, directory: String) -> anyhow::Result<()> {
+async fn stream_handler(mut stream: TcpStream, directory: Option<String>) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.split();
     let mut reader = BufReader::new(&mut reader);
     let request = reader_request(&mut reader).await?;
@@ -209,14 +225,13 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("directory")
                 .long("directory")
-                .required(true)
+                .required(false)
         )
         .get_matches();
 
     let directory = matches
-        .get_one::<String>("directory")
-        .unwrap()
-        .to_string();
+        .get_one::<String>("directory");
+
     println!("DEBUG: directory {:?}", directory);
 
 
@@ -226,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let directory = directory.clone();
+        let directory = directory.cloned();
         tokio::spawn(
             async move {
                 if let Err(err) = stream_handler(stream, directory).await {
